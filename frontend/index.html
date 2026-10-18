@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" href="/src/assets/branding/icon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Tomato Monitoring — Smart Plant Inspection Platform" />
+    <title>Smart Eye</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <script>
+      (() => {
+        const storageKey = 'smart-eye-theme-mode';
+        const validModes = ['dark', 'light'];
+
+        try {
+          const storedMode = window.localStorage.getItem(storageKey);
+          const resolvedMode = validModes.includes(storedMode) ? storedMode : 'dark';
+          document.documentElement.dataset.theme = resolvedMode;
+          document.documentElement.style.colorScheme = resolvedMode;
+        } catch {
+          document.documentElement.dataset.theme = 'dark';
+          document.documentElement.style.colorScheme = 'dark';
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

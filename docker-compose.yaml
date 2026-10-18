@@ -1,0 +1,255 @@
+
+networks:
+  web:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
+
+services:
+
+  # -----------------------------------------------------------
+  # TRAEFIK — Reverse Proxy
+  # Dashboard is disabled by default; access the proxy only through port 80.
+  # -----------------------------------------------------------
+  traefik:
+    image: traefik:v3.0
+    container_name: traefik
+    restart: unless-stopped
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=web"
+      - "--entrypoints.web.address=:80"
+      - "--api.dashboard=false"
+    ports:
+      - "80:80"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    networks:
+      - web
+
+  # -----------------------------------------------------------
+  # DATABASE — PostgreSQL 15
+  # Preserves original backend/docker-compose.yaml config exactly
+  # -----------------------------------------------------------
+  db:
+    image: postgres:15
+    container_name: tomato_db
+    restart: always
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks:
+      - web
+
+  redis:
+    image: redis:7-alpine
+    container_name: tomato_redis
+    restart: unless-stopped
+    networks:
+      - web
+
+  rabbitmq:
+    image: rabbitmq:4.3-management
+    container_name: tomato_rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:?Set RABBITMQ_DEFAULT_USER in .env}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD in .env}
+      RABBITMQ_DEFAULT_VHOST: /
+    command: >
+      sh -c "rabbitmq-plugins enable --offline rabbitmq_mqtt &&
+             rabbitmq-server"
+    ports:
+      - "127.0.0.1:5672:5672"
+      # MQTT remains reachable from the Raspberry Pi as required by the edge workflow.
+      - "${MQTT_BIND_ADDRESS:-0.0.0.0}:1883:1883"
+      - "127.0.0.1:15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks:
+      - web
+
+  # -----------------------------------------------------------
+  # BACKEND — Django (port 8000)
+  # Traefik routes: /api, /admin, and /static
+  # Higher priority (10) so it wins before the frontend catch-all
+  # -----------------------------------------------------------
+  # -----------------------------------------------------------
+  # AI WORKER - RabbitMQ AMQP Consumer for FAISS Inference
+  # Consumes MQTT-routed edge payloads from RabbitMQ through AMQP
+  # -----------------------------------------------------------
+  ai_worker:
+    build:
+      context: ./ai_assets
+      dockerfile: Dockerfile.worker
+    container_name: tomato_ai_worker
+    restart: unless-stopped
+    environment:
+      AI_WORKER_RABBITMQ_HOST: rabbitmq
+      AI_WORKER_RABBITMQ_PORT: "5672"
+      AI_WORKER_RABBITMQ_USERNAME: ${RABBITMQ_DEFAULT_USER:?Set RABBITMQ_DEFAULT_USER in .env}
+      AI_WORKER_RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD in .env}
+      AI_WORKER_RABBITMQ_VHOST: /
+      AI_WORKER_REQUEST_EXCHANGE: amq.topic
+      AI_WORKER_REQUEST_QUEUE: tomato.ai.inference.requests.v1
+      AI_WORKER_REQUEST_BINDING_KEY: tomato.edge.v1.*.feature-vector
+      AI_WORKER_DEAD_LETTER_EXCHANGE: tomato.ai.inference.deadletter
+      AI_WORKER_DEAD_LETTER_QUEUE: tomato.ai.inference.deadletter.v1
+      AI_WORKER_DEAD_LETTER_ROUTING_KEY: tomato.ai.inference.deadletter.v1
+      AI_WORKER_PREFETCH_COUNT: "1"
+      AI_WORKER_LOG_LEVEL: INFO
+      AI_WORKER_RESULT_SINK: backend_http
+      AI_WORKER_BACKEND_INGESTION_URL: http://backend:8000/api/v1/inspections/ingest-ai-result/
+      AI_WORKER_BACKEND_INGESTION_TOKEN: ${AI_WORKER_INGESTION_TOKEN:?Set AI_WORKER_INGESTION_TOKEN in .env}
+      AI_WORKER_BACKEND_TIMEOUT_SECONDS: "10"
+      AI_WORKER_BACKEND_MAX_ATTEMPTS: "3"
+      AI_WORKER_BACKEND_RETRY_DELAY_SECONDS: "2"
+      AI_WORKER_ASSETS_DIR: /app/ai_assets
+      AI_WORKER_TOP_K_DISEASE: "5"
+      AI_WORKER_MIN_ORGAN_CLASSIFIER_PROBA: "0.70"
+    depends_on:
+      backend:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+    command: ["python", "-m", "ai_worker.consumer"]
+    networks:
+      - web
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: tomato_backend
+    restart: unless-stopped
+    environment:
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?Set DJANGO_SECRET_KEY in .env}
+      DJANGO_DEBUG: ${DJANGO_DEBUG:-false}
+      DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1}
+      AI_ASSETS_DIR: /app/ai_assets
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      REDIS_URL: redis://redis:6379/0
+      AI_WORKER_INGESTION_TOKEN: ${AI_WORKER_INGESTION_TOKEN:?Set AI_WORKER_INGESTION_TOKEN in .env}
+      EVIDENCE_IMAGE_UPLOAD_TOKEN: ${EVIDENCE_IMAGE_UPLOAD_TOKEN:?Set EVIDENCE_IMAGE_UPLOAD_TOKEN in .env}
+      EVIDENCE_IMAGE_COMMANDS_ENABLED: ${EVIDENCE_IMAGE_COMMANDS_ENABLED:-false}
+      EVIDENCE_IMAGE_COMMAND_RABBITMQ_HOST: rabbitmq
+      EVIDENCE_IMAGE_COMMAND_RABBITMQ_PORT: "5672"
+      EVIDENCE_IMAGE_COMMAND_RABBITMQ_USERNAME: ${RABBITMQ_DEFAULT_USER:?Set RABBITMQ_DEFAULT_USER in .env}
+      EVIDENCE_IMAGE_COMMAND_RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD in .env}
+      EVIDENCE_IMAGE_COMMAND_RABBITMQ_VHOST: /
+      EVIDENCE_IMAGE_COMMAND_EXCHANGE: amq.topic
+      EVIDENCE_IMAGE_COMMAND_ROUTING_KEY_TEMPLATE: tomato.edge.v1.{device_identifier}.commands.image-request
+      EMAIL_NOTIFICATIONS_ENABLED: ${EMAIL_NOTIFICATIONS_ENABLED:-false}
+      EMAIL_BACKEND: ${EMAIL_BACKEND:-django.core.mail.backends.console.EmailBackend}
+      EMAIL_HOST: ${EMAIL_HOST:-}
+      EMAIL_PORT: ${EMAIL_PORT:-25}
+      EMAIL_USE_TLS: ${EMAIL_USE_TLS:-false}
+      EMAIL_HOST_USER: ${EMAIL_HOST_USER:-}
+      EMAIL_HOST_PASSWORD: ${EMAIL_HOST_PASSWORD:-}
+      DEFAULT_FROM_EMAIL: ${DEFAULT_FROM_EMAIL:-Smart Eye Alerts <alerts@example.com>}
+      FRONTEND_BASE_URL: ${FRONTEND_BASE_URL:-http://localhost}
+      ALERT_EMAIL_RECIPIENTS: ${ALERT_EMAIL_RECIPIENTS:-}
+      REVIEW_EMAIL_RECIPIENTS: ${REVIEW_EMAIL_RECIPIENTS:-}
+    volumes:
+      - ./ai_assets:/app/ai_assets
+      - ./backend/media:/app/media
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: >
+      sh -c "python manage.py migrate &&
+             daphne -b 0.0.0.0 -p 8000 config.asgi:application"
+    networks:
+      - web
+    labels:
+      - "traefik.enable=true"
+
+      # ---------- /api/** → backend ----------
+      - "traefik.http.routers.backend-api.rule=PathPrefix(`/api`)"
+      - "traefik.http.routers.backend-api.entrypoints=web"
+      - "traefik.http.routers.backend-api.priority=10"
+      - "traefik.http.routers.backend-api.service=backend-svc"
+
+      # ---------- /media/** → backend ----------
+      - "traefik.http.routers.backend-media.rule=PathPrefix(`/media`)"
+      - "traefik.http.routers.backend-media.entrypoints=web"
+      - "traefik.http.routers.backend-media.priority=10"
+      - "traefik.http.routers.backend-media.service=backend-svc"
+
+      # ---------- /admin/** → backend ----------
+      - "traefik.http.routers.backend-admin.rule=PathPrefix(`/admin`)"
+      - "traefik.http.routers.backend-admin.entrypoints=web"
+      - "traefik.http.routers.backend-admin.priority=10"
+      - "traefik.http.routers.backend-admin.service=backend-svc"
+
+      - "traefik.http.routers.backend-ws-notifications.rule=PathPrefix(`/ws/notifications`)"
+      - "traefik.http.routers.backend-ws-notifications.entrypoints=web"
+      - "traefik.http.routers.backend-ws-notifications.priority=11"
+      - "traefik.http.routers.backend-ws-notifications.service=backend-svc"
+
+      - "traefik.http.routers.backend-static.rule=PathPrefix(`/static`)"
+      - "traefik.http.routers.backend-static.entrypoints=web"
+      - "traefik.http.routers.backend-static.priority=10"
+      - "traefik.http.routers.backend-static.service=backend-svc"
+
+      # ---------- backend service definition ----------
+      - "traefik.http.services.backend-svc.loadbalancer.server.port=8000"
+
+  # -----------------------------------------------------------
+  # FRONTEND — Vite React (port 3000)
+  # Traefik route: catch-all /  (priority=1, lowest)
+  # Volumes provide hot reload without rebuilding
+  # -----------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: tomato_frontend
+    restart: unless-stopped
+    environment:
+      NODE_OPTIONS: --max-old-space-size=4096
+      VITE_USE_POLLING: "false"
+      VITE_WATCH_INTERVAL: "1000"
+    command: >
+      sh -c "npm run build &&
+             npm run preview -- --host 0.0.0.0 --port 3000"
+    # Frontend is intentionally exposed through Traefik on http://localhost
+    # instead of binding a direct host port such as 3001:3000.
+    networks:
+      - web
+    labels:
+      - "traefik.enable=true"
+      - "com.tomato.frontend.exposure=traefik-only"
+
+      # ---------- /** → frontend (catch-all, lowest priority) ----------
+      - "traefik.http.routers.frontend.rule=PathPrefix(`/`)"
+      - "traefik.http.routers.frontend.entrypoints=web"
+      - "traefik.http.routers.frontend.priority=1"
+      - "traefik.http.routers.frontend.service=frontend-svc"
+
+      # ---------- frontend service definition ----------
+      - "traefik.http.services.frontend-svc.loadbalancer.server.port=3000"

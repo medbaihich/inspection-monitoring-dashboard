@@ -1,0 +1,462 @@
+import { useMemo } from 'react';
+import {
+  IconButton,
+  Tooltip,
+} from '@mui/material';
+import {
+  RoomOutlined as RoomOutlinedIcon,
+  VisibilityOutlined as VisibilityOutlinedIcon,
+} from '@mui/icons-material';
+import {
+  flexRender,
+  getCoreRowModel,
+  useReactTable,
+} from '@tanstack/react-table';
+import { RefreshCw } from 'lucide-react';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Skeleton } from '@/components/ui/skeleton';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table';
+import { cn } from '@/lib/utils';
+import { useThemeMode } from '@/theme-mode-context';
+import {
+  formatInspectionConfidence,
+  formatInspectionDateTime,
+  resolveInspectionDeviceLabel,
+  resolveInspectionDiseaseLabel,
+} from '@/features/inspections/utils';
+
+const PAGE_SIZE_OPTIONS = [10, 20, 50, 100];
+
+function formatLabel(value) {
+  if (!value) {
+    return 'N/A';
+  }
+
+  return String(value)
+    .replaceAll('_', ' ')
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function SortButton({ column, children }) {
+  const sorted = column.getIsSorted();
+
+  return (
+    <button
+      type="button"
+      className="inline-flex items-center gap-1 font-semibold text-foreground hover:text-primary"
+      onClick={column.getToggleSortingHandler()}
+    >
+      {children}
+      <span className="w-3 text-xs text-muted-foreground">
+        {sorted === 'asc' ? '^' : sorted === 'desc' ? 'v' : ''}
+      </span>
+    </button>
+  );
+}
+
+function InspectionsTableSkeleton() {
+  return (
+    <div className="space-y-2">
+      {Array.from({ length: 8 }).map((_, index) => (
+        <Skeleton key={index} className="h-10 w-full" />
+      ))}
+    </div>
+  );
+}
+
+function ActionIconButton({
+  icon,
+  title,
+  ariaLabel,
+  onClick,
+  isLightMode,
+}) {
+  return (
+    <Tooltip title={title} arrow>
+      <IconButton
+        size="small"
+        aria-label={ariaLabel}
+        onClick={(event) => {
+          event.stopPropagation();
+          onClick();
+        }}
+        onMouseDown={(event) => event.stopPropagation()}
+        onKeyDown={(event) => event.stopPropagation()}
+        sx={{
+          width: 30,
+          height: 30,
+          borderRadius: 1.5,
+          color: isLightMode ? '#475569' : 'rgba(226, 232, 240, 0.92)',
+          border: '1px solid',
+          borderColor: isLightMode ? 'rgba(203, 213, 225, 0.92)' : 'rgba(255, 255, 255, 0.12)',
+          bgcolor: isLightMode ? 'rgba(255, 255, 255, 0.92)' : 'rgba(255, 255, 255, 0.04)',
+          '&:hover': {
+            borderColor: isLightMode ? 'rgba(148, 163, 184, 0.4)' : 'rgba(255, 255, 255, 0.2)',
+            bgcolor: isLightMode ? 'rgba(248, 250, 252, 0.98)' : 'rgba(255, 255, 255, 0.08)',
+          },
+        }}
+      >
+        {icon}
+      </IconButton>
+    </Tooltip>
+  );
+}
+
+function ToneBadge({ label, tone = 'neutral' }) {
+  const toneClassName = {
+    new: 'border-sky-200 bg-sky-50 text-sky-700',
+    reviewed: 'border-emerald-200 bg-emerald-50 text-emerald-700',
+    closed: 'border-slate-200 bg-slate-100 text-slate-700',
+    pending: 'border-amber-200 bg-amber-50 text-amber-700',
+    processing: 'border-blue-200 bg-blue-50 text-blue-700',
+    completed: 'border-emerald-200 bg-emerald-50 text-emerald-700',
+    failed: 'border-rose-200 bg-rose-50 text-rose-700',
+    neutral: 'border-border bg-background text-foreground',
+  }[tone] || 'border-border bg-background text-foreground';
+
+  return (
+    <Badge variant="outline" className={cn('font-medium', toneClassName)}>
+      {formatLabel(label)}
+    </Badge>
+  );
+}
+
+function resolveStatusTone(status) {
+  if (status === 'new') {
+    return 'new';
+  }
+
+  if (status === 'reviewed') {
+    return 'reviewed';
+  }
+
+  if (status === 'closed') {
+    return 'closed';
+  }
+
+  return 'neutral';
+}
+
+function resolveProcessingTone(status) {
+  if (status === 'pending') {
+    return 'pending';
+  }
+
+  if (status === 'processing') {
+    return 'processing';
+  }
+
+  if (status === 'completed') {
+    return 'completed';
+  }
+
+  if (status === 'failed') {
+    return 'failed';
+  }
+
+  return 'neutral';
+}
+
+export default function InspectionsTable({
+  inspections,
+  totalCount,
+  isLoading,
+  isFetching,
+  pageIndex,
+  pageSize,
+  sorting,
+  selectedInspectionId,
+  deviceMap,
+  diseaseMap,
+  onPaginationChange,
+  onSortingChange,
+  onSelectInspection,
+  onRefresh,
+  onShowInspectionOnMap,
+}) {
+  const { mode } = useThemeMode();
+  const isLightMode = mode === 'light';
+  const pageCount = Math.max(1, Math.ceil(totalCount / pageSize));
+  const toolbarClassName = isLightMode
+    ? 'rounded-xl border border-slate-200 bg-white/72 px-2.5 py-2 shadow-[0_10px_24px_rgba(15,23,42,0.04)]'
+    : '';
+  const tableShellClassName = isLightMode
+    ? 'rounded-xl border border-slate-200 bg-white/84 shadow-[0_14px_30px_rgba(15,23,42,0.05)]'
+    : 'rounded-md border border-border bg-card';
+  const footerClassName = isLightMode
+    ? 'rounded-xl border border-slate-200 bg-white/72 px-3 py-2.5 shadow-[0_10px_24px_rgba(15,23,42,0.04)]'
+    : '';
+  const stickyActionCellClassName = isLightMode
+    ? 'sticky right-0 z-10 border-l border-slate-200/90 bg-white/96'
+    : 'sticky right-0 z-10 border-l border-border/80 bg-card';
+  const stickyActionHeaderClassName = isLightMode
+    ? 'sticky right-0 z-20 border-l border-slate-200/90 bg-slate-50/95'
+    : 'sticky right-0 z-20 border-l border-border/80 bg-card';
+  const columns = useMemo(
+    () => [
+      {
+        id: 'prediction',
+        accessorFn: (row) => row.top1_label || resolveInspectionDiseaseLabel(row.predicted_disease, diseaseMap),
+        header: 'Disease',
+        enableSorting: false,
+        cell: ({ row }) => (
+          <div className="max-w-[11rem]">
+            <div className="truncate text-sm font-semibold text-foreground">
+              {row.original.top1_label || resolveInspectionDiseaseLabel(row.original.predicted_disease, diseaseMap)}
+            </div>
+          </div>
+        ),
+      },
+      {
+        accessorKey: 'organ_type',
+        header: 'Organ',
+        enableSorting: false,
+        cell: ({ row }) => (
+          <Badge variant="outline" className="bg-background px-2 py-0.5 font-medium">
+            {formatLabel(row.original.organ_type)}
+          </Badge>
+        ),
+      },
+      {
+        id: 'device',
+        header: 'Device',
+        enableSorting: false,
+        cell: ({ row }) => (
+          <span className="block max-w-[10rem] truncate text-sm text-foreground xl:max-w-[12rem]">
+            {resolveInspectionDeviceLabel(row.original.device, deviceMap)}
+          </span>
+        ),
+      },
+      {
+        accessorKey: 'confidence_score',
+        header: ({ column }) => <SortButton column={column}>Confidence</SortButton>,
+        cell: ({ row }) => (
+          <span className="whitespace-nowrap text-sm text-muted-foreground">
+            {formatInspectionConfidence(row.original.confidence_score)}
+          </span>
+        ),
+      },
+      {
+        accessorKey: 'status',
+        header: 'Status',
+        enableSorting: false,
+        cell: ({ row }) => (
+          <ToneBadge label={row.original.status} tone={resolveStatusTone(row.original.status)} />
+        ),
+      },
+      {
+        accessorKey: 'processing_status',
+        header: 'Processing',
+        enableSorting: false,
+        cell: ({ row }) => (
+          <ToneBadge
+            label={row.original.processing_status}
+            tone={resolveProcessingTone(row.original.processing_status)}
+          />
+        ),
+      },
+      {
+        accessorKey: 'captured_at',
+        header: ({ column }) => <SortButton column={column}>Captured</SortButton>,
+        cell: ({ row }) => (
+          <span className="whitespace-nowrap text-xs text-muted-foreground">
+            {formatInspectionDateTime(row.original.captured_at)}
+          </span>
+        ),
+      },
+      {
+        id: 'processed_or_updated',
+        accessorFn: (row) => row.processed_at || row.updated_at,
+        header: ({ column }) => <SortButton column={column}>Processed</SortButton>,
+        cell: ({ row }) => (
+          <span className="whitespace-nowrap text-xs text-muted-foreground">
+            {formatInspectionDateTime(row.original.processed_at || row.original.updated_at)}
+          </span>
+        ),
+      },
+      {
+        id: 'actions',
+        enableSorting: false,
+        header: () => <div className="text-right">Actions</div>,
+        cell: ({ row }) => (
+          <div className="flex min-w-[4.75rem] items-center justify-end gap-1">
+            <ActionIconButton
+              title="View inspection"
+              ariaLabel={`View inspection ${row.original.top1_label || row.original.source_message_id || row.original.id}`}
+              icon={<VisibilityOutlinedIcon sx={{ fontSize: 17 }} />}
+              onClick={() => onSelectInspection(row.original)}
+              isLightMode={isLightMode}
+            />
+            <ActionIconButton
+              title="Show on map"
+              ariaLabel={`Show inspection ${row.original.top1_label || row.original.source_message_id || row.original.id} on map`}
+              icon={<RoomOutlinedIcon sx={{ fontSize: 17 }} />}
+              onClick={() => onShowInspectionOnMap(row.original)}
+              isLightMode={isLightMode}
+            />
+          </div>
+        ),
+      },
+    ],
+    [deviceMap, diseaseMap, isLightMode, onSelectInspection, onShowInspectionOnMap],
+  );
+
+  // TanStack Table intentionally returns non-memoizable helpers.
+  // eslint-disable-next-line react-hooks/incompatible-library
+  const table = useReactTable({
+    data: inspections,
+    columns,
+    pageCount,
+    state: {
+      pagination: { pageIndex, pageSize },
+      sorting,
+    },
+    manualPagination: true,
+    manualSorting: true,
+    enableMultiSort: false,
+    onPaginationChange,
+    onSortingChange,
+    getCoreRowModel: getCoreRowModel(),
+  });
+  const firstRow = totalCount === 0 ? 0 : pageIndex * pageSize + 1;
+  const lastRow = Math.min(totalCount, (pageIndex + 1) * pageSize);
+
+  return (
+    <div className="space-y-3">
+      <div className={cn('flex items-start justify-end', toolbarClassName)}>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="gap-2"
+          onClick={onRefresh}
+          disabled={isFetching}
+        >
+          <RefreshCw className={cn('h-4 w-4', isFetching && 'animate-spin')} aria-hidden="true" />
+          Refresh
+        </Button>
+      </div>
+
+      {isLoading ? (
+        <InspectionsTableSkeleton />
+      ) : (
+        <div className={tableShellClassName}>
+          <Table className="min-w-full">
+            <TableHeader>
+              {table.getHeaderGroups().map((headerGroup) => (
+                <TableRow key={headerGroup.id} className="hover:bg-transparent">
+                  {headerGroup.headers.map((header) => (
+                    <TableHead
+                      key={header.id}
+                      className={cn(
+                        'h-10 whitespace-nowrap px-2.5',
+                        header.column.id === 'actions' && 'text-right',
+                        header.column.id === 'prediction' && 'w-[12%] min-w-[9rem]',
+                        header.column.id === 'organ_type' && 'w-[8%] min-w-[6rem]',
+                        header.column.id === 'device' && 'w-[16%] min-w-[8.5rem]',
+                        header.column.id === 'confidence_score' && 'w-[9%] min-w-[6.5rem]',
+                        header.column.id === 'status' && 'w-[10%] min-w-[7rem]',
+                        header.column.id === 'processing_status' && 'w-[11%] min-w-[8rem]',
+                        header.column.id === 'captured_at' && 'w-[12%] min-w-[8.5rem]',
+                        header.column.id === 'processed_or_updated' && 'w-[12%] min-w-[8.5rem]',
+                        header.column.id === 'actions' && cn('w-[6.5rem] min-w-[6.5rem]', stickyActionHeaderClassName),
+                        isLightMode && 'bg-slate-50/80 text-slate-600',
+                      )}
+                    >
+                      {header.isPlaceholder
+                        ? null
+                        : flexRender(header.column.columnDef.header, header.getContext())}
+                    </TableHead>
+                  ))}
+                </TableRow>
+              ))}
+            </TableHeader>
+            <TableBody>
+              {table.getRowModel().rows.length ? (
+                table.getRowModel().rows.map((row) => (
+                  <TableRow
+                    key={row.id}
+                    data-state={selectedInspectionId === row.original.id ? 'selected' : undefined}
+                    className={cn(
+                      'cursor-pointer transition-colors',
+                      isLightMode
+                        ? 'hover:bg-emerald-50/55 data-[state=selected]:bg-emerald-50/80'
+                        : '',
+                    )}
+                    onClick={() => onSelectInspection(row.original)}
+                  >
+                    {row.getVisibleCells().map((cell) => (
+                      <TableCell
+                        key={cell.id}
+                        className={cn(
+                          'px-2.5 py-2.5',
+                          cell.column.id === 'actions' && stickyActionCellClassName,
+                        )}
+                      >
+                        {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                      </TableCell>
+                    ))}
+                  </TableRow>
+                ))
+              ) : (
+                <TableRow>
+                  <TableCell colSpan={table.getAllLeafColumns().length} className="h-28 text-center text-muted-foreground">
+                    No inspections match the current registry state.
+                  </TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+
+      <div className={cn('flex flex-col gap-2 text-sm text-muted-foreground sm:flex-row sm:items-center sm:justify-between', footerClassName)}>
+        <span>
+          Showing {firstRow}-{lastRow} of {totalCount}
+        </span>
+        <div className="flex items-center gap-2">
+          <select
+            value={pageSize}
+            onChange={(event) => table.setPageSize(Number(event.target.value))}
+            className="h-8 rounded-md border border-input bg-background px-2 text-sm text-foreground"
+          >
+            {PAGE_SIZE_OPTIONS.map((option) => (
+              <option key={option} value={option}>
+                {option} rows
+              </option>
+            ))}
+          </select>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => table.previousPage()}
+            disabled={!table.getCanPreviousPage()}
+          >
+            Previous
+          </Button>
+          <span className="whitespace-nowrap">
+            Page {pageIndex + 1} of {pageCount}
+          </span>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => table.nextPage()}
+            disabled={!table.getCanNextPage()}
+          >
+            Next
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
